@@ -1,11 +1,8 @@
 const passport = require('passport');
-const strategy = process.env.SESSION_SECRET
 const axios = require('axios');
 
 const User = require('../models/githubIntegration');
-const express = require("express");  // MongoDB model
 
-// Check the GitHub connection status
 exports.checkStatus = (req, res) => {
     if (req.isAuthenticated()) {
         User.findOne({ githubId: req.user.githubId })
@@ -29,7 +26,6 @@ exports.checkStatus = (req, res) => {
     }
 };
 
-// Handle GitHub authentication redirect
 exports.authGitHub = passport.authenticate('github', { scope: ['user', 'repo'] });
 
 // GitHub callback to handle success/failure
@@ -37,73 +33,130 @@ exports.githubCallback = (req, res) => {
     res.redirect('http://localhost:4200');
 };
 
-exports.getRepoDetails = async(req, res)=> {
+exports.getRepoDetails = async (req, res) => {
     const { org, repo } = req.params;
 
+    const fetchAllPages = async (baseUrl, headers, params = {}) => {
+        let results = [];
+        let page = 1;
+        let hasMore = true;
+
+        while (hasMore) {
+            const url = `${baseUrl}?${new URLSearchParams({ ...params, page, per_page: 100 }).toString()}`;
+            console.log(`Fetching: ${url}`);
+            try {
+                const response = await axios.get(url, { headers });
+                results = results.concat(response.data);
+
+                // If fewer than 100 items are returned, we are at the last page
+                if (response.data.length < 100) {
+                    hasMore = false;
+                } else {
+                    page++;
+                }
+            } catch (error) {
+                if (error.response) {
+                    console.error('Error response status:', error.response.status);
+                    console.error('Error response data:', error.response.data);
+                } else {
+                    console.error('Error:', error.message);
+                }
+                throw new Error('Failed to fetch paginated data');
+            }
+        }
+
+        return results;
+    };
+
+    const fetchCount = async (url, headers, params = {}) => {
+        try {
+            const query = new URLSearchParams({ ...params, per_page: 1 }).toString();
+            const response = await axios.get(`${url}?${query}`, { headers });
+
+            const linkHeader = response.headers.link;
+            if (linkHeader) {
+                const lastPageMatch = linkHeader.match(/&page=(\d+)>; rel="last"/);
+                if (lastPageMatch) {
+                    return parseInt(lastPageMatch[1], 10); // Total count based on last page number
+                }
+            }
+
+            // For GitHub Search API, use total_count directly
+            if (response.data.total_count !== undefined) {
+                return response.data.total_count;
+            }
+
+            // Fallback if no pagination headers are present
+            return response.data.length || 0;
+        } catch (error) {
+            if (error.response) {
+                console.error('Error response status:', error.response.status);
+                console.error('Error response data:', error.response.data);
+            } else {
+                console.error('Error:', error.message);
+            }
+            throw new Error('Failed to fetch count');
+        }
+    };
+
     try {
-        const commitsResponse = await axios.get(`https://api.github.com/repos/${org}/${repo}/commits`, {
-            headers: {
-                Authorization: `Bearer ${req.user.accessToken}`
-            }
-        });
+        const headers = {
+            Authorization: `Bearer ${req.user.accessToken}`
+        };
 
-        // Fetch pull requests
-        const pullsResponse = await axios.get(`https://api.github.com/repos/${org}/${repo}/pulls`, {
-            headers: {
-                Authorization: `Bearer ${req.user.accessToken}`
-            }
-        });
+        // Fetch counts
+        const commitsCount = await fetchCount(
+            `https://api.github.com/repos/${org}/${repo}/commits`,
+            headers
+        );
 
-        // Fetch issues
-        const issuesResponse = await axios.get(`https://api.github.com/repos/${org}/${repo}/issues`, {
-            headers: {
-                Authorization: `Bearer ${req.user.accessToken}`
-            }
-        });
+        const issuesCount = await fetchCount(
+            `https://api.github.com/search/issues`,
+            headers,
+            { q: `repo:${org}/${repo} type:issue` } // Search issues in the repository
+        );
 
+        const pullRequestsCount = await fetchCount(
+            `https://api.github.com/repos/${org}/${repo}/pulls`,
+            headers,
+            { state: 'all' } // Fetch all PRs
+        );
 
+        // Fetch all commits, pull requests, and issues
+        const commits = await fetchAllPages(
+            `https://api.github.com/repos/${org}/${repo}/commits`,
+            headers
+        );
+        const pullRequests = await fetchAllPages(
+            `https://api.github.com/repos/${org}/${repo}/pulls`,
+            headers,
+            { state: 'all' }
+        );
+        const issues = await fetchAllPages(
+            `https://api.github.com/repos/${org}/${repo}/issues`,
+            headers,
+            { state: 'all' }
+        );
 
-
-
-
-
-
-        const commits = commitsResponse.data.map((commit) => ({
-            author: commit.commit.author.name,
-        }));
-
-        const pullRequests = pullsResponse.data.map((pr) => ({
-            user: pr.user.login,
-        }));
-
-        const issues = issuesResponse.data.map((issue) => ({
-            user: issue.user.login,
-        }));
-
-        // Aggregate user stats
         const userStats = {};
-
-        // Process commits
         commits.forEach((commit) => {
-            const user = commit.author || 'Unknown';
+            const user = commit.commit.author?.name || 'Unknown';
             if (!userStats[user]) {
                 userStats[user] = { commits: 0, pullRequests: 0, issues: 0 };
             }
             userStats[user].commits++;
         });
 
-        // Process pull requests
         pullRequests.forEach((pr) => {
-            const user = pr.user || 'Unknown';
+            const user = pr.user?.login || 'Unknown';
             if (!userStats[user]) {
                 userStats[user] = { commits: 0, pullRequests: 0, issues: 0 };
             }
             userStats[user].pullRequests++;
         });
 
-        // Process issues
         issues.forEach((issue) => {
-            const user = issue.user || 'Unknown';
+            const user = issue.user?.login || 'Unknown';
             if (!userStats[user]) {
                 userStats[user] = { commits: 0, pullRequests: 0, issues: 0 };
             }
@@ -111,17 +164,30 @@ exports.getRepoDetails = async(req, res)=> {
         });
 
         res.json({
-            commits,
-            pullRequests,
-            issues,
-            userStats,
+            counts: {
+                commitsCount,
+                pullRequestsCount,
+                issuesCount
+            },
+            data: {
+                commits,
+                pullRequests,
+                issues
+            },
+            userStats
         });
     } catch (error) {
-        console.error('Error fetching repository details:', error.message);
+        if (error.response) {
+            console.error('Error response status:', error.response.status);
+            console.error('Error response data:', error.response.data);
+        } else {
+            console.error('Error:', error.message);
+        }
         res.status(500).json({ error: 'Failed to fetch repository details' });
     }
-}
-// Disconnect GitHub integration
+};
+
+
 exports.disconnectGitHub = async (req, res) => {
     if (req.isAuthenticated()) {
         try {
@@ -138,9 +204,6 @@ exports.disconnectGitHub = async (req, res) => {
     }
 };
 
-// controllers/githubController.js
-
-// Fetch the organizations associated with the authenticated GitHub user
 exports.getOrganizationsRepos = async (req, res) => {
     console.log('Fetching organizations...');
 
@@ -150,7 +213,6 @@ exports.getOrganizationsRepos = async (req, res) => {
 
     try {
 
-        // Fetch organizations from GitHub
         const response = await axios.get('https://api.github.com/user/orgs', {
             headers: {
                 Authorization: `Bearer ${req.user.accessToken}`
@@ -158,13 +220,10 @@ exports.getOrganizationsRepos = async (req, res) => {
         });
 
         const organizations = response.data;
-
-        // Now, fetch repositories for each organization
         const allRepos = await Promise.all(organizations.map(async (org) => {
             return getRepositoriesForOrganization(org.login, req.user.accessToken);
         }));
 
-        // Combine the repositories for all organizations into one array
         const combinedRepos = allRepos.flat();
 
         res.json(combinedRepos);
@@ -175,7 +234,6 @@ exports.getOrganizationsRepos = async (req, res) => {
     }
 };
 
-// Fetch all repositories for a given organization
 const getRepositoriesForOrganization = async (org, accessToken) => {
     try {
         const response = await axios.get(`https://api.github.com/orgs/${org}/repos`, {
@@ -183,7 +241,7 @@ const getRepositoriesForOrganization = async (org, accessToken) => {
                 Authorization: `Bearer ${accessToken}`
             }
         });
-        return response.data; // Return repositories for this organization
+        return response.data;
     } catch (err) {
         console.error(`Failed to fetch repositories for organization ${org}:`, err);
         throw new Error(`Failed to fetch repositories for organization ${org}`);

@@ -1,4 +1,3 @@
-// models/githubIntegration.js
 const mongoose = require('mongoose');
 
 const githubIntegrationSchema = new mongoose.Schema({

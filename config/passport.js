@@ -1,4 +1,3 @@
-// config/passport.js
 const passport = require('passport');
 const GitHubStrategy = require('passport-github2').Strategy;
 const User = require('../models/githubIntegration');  // MongoDB model
